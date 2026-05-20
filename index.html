@@ -457,6 +457,35 @@
       position: relative;
     }
 
+    /* Inline edit diff (visible only when the span is not focused) */
+    .text-seg .te-del {
+      color: #b91c1c;
+      text-decoration: line-through;
+      text-decoration-color: #b91c1c;
+      background: rgba(239, 68, 68, 0.10);
+      border-radius: 2px;
+      padding: 0 1px;
+    }
+
+    .text-seg .te-add {
+      color: #166534;
+      background: rgba(34, 197, 94, 0.18);
+      border-radius: 2px;
+      padding: 0 1px;
+      font-weight: 600;
+    }
+
+    [data-theme="dark"] .text-seg .te-del {
+      color: #fca5a5;
+      text-decoration-color: #fca5a5;
+      background: rgba(239, 68, 68, 0.18);
+    }
+
+    [data-theme="dark"] .text-seg .te-add {
+      color: #86efac;
+      background: rgba(34, 197, 94, 0.22);
+    }
+
     .text-editor {
       font-family: inherit;
       font-size: inherit;
@@ -1166,6 +1195,7 @@
       <kbd>Tab</kbd> review tags &middot;
       <kbd>&#8593;</kbd><kbd>&#8595;</kbd> browse all tags &middot;
       <kbd>&#8592;</kbd><kbd>&#8594;</kbd> pages &middot;
+      <kbd>Shift</kbd>+<kbd>Space</kbd> next page (works while editing) &middot;
       Double-click text to edit &middot;
       <kbd>Esc</kbd> cancel
     </footer>
@@ -1377,6 +1407,134 @@
       return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
+    // Manchu/Möllendorff-style ASCII shortcuts used while typing corrections:
+    //   x -> š, X -> Š, v -> ū, V -> Ū
+    // Applied case-matched in any editable region the reviewer types in.
+    const TRANSLITERATE_MAP = { 'x': 'š', 'X': 'Š', 'v': 'ū', 'V': 'Ū' };
+    const TRANSLITERATE_RE  = /[xXvV]/g;
+    function applyTransliteration(s) {
+      return s.replace(TRANSLITERATE_RE, ch => TRANSLITERATE_MAP[ch]);
+    }
+
+    // Character-level diff via LCS. Returns HTML with .te-del / .te-add spans.
+    // Deleted spans are contenteditable=false so the caret skips over them and
+    // backspace removes them atomically — that keeps live-edit math simple.
+    // Falls back to plain rendering when one side is very long, to keep things cheap.
+    function renderCharDiff(oldStr, newStr) {
+      if (oldStr === newStr) return esc(newStr);
+      const MAX = 4000;
+      if (oldStr.length + newStr.length > MAX) {
+        return `<span class="te-del" contenteditable="false">${esc(oldStr)}</span>` +
+               `<span class="te-add">${esc(newStr)}</span>`;
+      }
+      const a = Array.from(oldStr);
+      const b = Array.from(newStr);
+      const n = a.length, m = b.length;
+      const dp = new Array(n + 1);
+      for (let i = 0; i <= n; i++) dp[i] = new Int32Array(m + 1);
+      for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+          dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+      }
+      let out = '';
+      let delBuf = '', addBuf = '';
+      const flush = () => {
+        if (delBuf) { out += `<span class="te-del" contenteditable="false">${esc(delBuf)}</span>`; delBuf = ''; }
+        if (addBuf) { out += `<span class="te-add">${esc(addBuf)}</span>`; addBuf = ''; }
+      };
+      let i = 0, j = 0;
+      while (i < n && j < m) {
+        if (a[i] === b[j]) { flush(); out += esc(a[i]); i++; j++; }
+        else if (dp[i + 1][j] >= dp[i][j + 1]) { delBuf += a[i]; i++; }
+        else { addBuf += b[j]; j++; }
+      }
+      while (i < n) { delBuf += a[i++]; }
+      while (j < m) { addBuf += b[j++]; }
+      flush();
+      return out;
+    }
+
+    // Read the live edited text from a .text-seg, ignoring .te-del markers
+    // (which represent deleted-from-original characters, not current content).
+    function readSegLiveText(seg) {
+      let out = '';
+      const walk = (node) => {
+        if (node.nodeType === Node.TEXT_NODE) { out += node.nodeValue; return; }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        if (node.classList && node.classList.contains('te-del')) return;
+        for (const child of node.childNodes) walk(child);
+      };
+      for (const child of seg.childNodes) walk(child);
+      return out;
+    }
+
+    // Caret offset within a .text-seg measured in live (non-deleted) chars.
+    function getSegCaretOffset(seg) {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return null;
+      const range = sel.getRangeAt(0);
+      if (!seg.contains(range.endContainer)) return null;
+      let offset = 0;
+      let done = false;
+      const walk = (node) => {
+        if (done) return;
+        if (node === range.endContainer) {
+          if (node.nodeType === Node.TEXT_NODE) {
+            offset += range.endOffset;
+          } else {
+            for (let k = 0; k < range.endOffset; k++) {
+              const child = node.childNodes[k];
+              if (!child) break;
+              if (child.nodeType === Node.ELEMENT_NODE && child.classList && child.classList.contains('te-del')) continue;
+              offset += (child.textContent || '').length;
+            }
+          }
+          done = true;
+          return;
+        }
+        if (node.nodeType === Node.TEXT_NODE) { offset += node.nodeValue.length; return; }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        if (node.classList && node.classList.contains('te-del')) return;
+        for (const child of node.childNodes) walk(child);
+      };
+      for (const child of seg.childNodes) walk(child);
+      return done ? offset : null;
+    }
+
+    // Place the caret at the given live-char offset within a .text-seg.
+    function setSegCaretOffset(seg, target) {
+      const range = document.createRange();
+      let remaining = target;
+      let placed = false;
+      const walk = (node) => {
+        if (placed) return;
+        if (node.nodeType === Node.TEXT_NODE) {
+          const len = node.nodeValue.length;
+          if (remaining <= len) {
+            range.setStart(node, remaining);
+            range.collapse(true);
+            placed = true;
+            return;
+          }
+          remaining -= len;
+          return;
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        if (node.classList && node.classList.contains('te-del')) return;
+        for (const child of node.childNodes) walk(child);
+      };
+      for (const child of seg.childNodes) walk(child);
+      if (!placed) {
+        // Fall back to end of span
+        range.selectNodeContents(seg);
+        range.collapse(false);
+      }
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+
     function getStats() {
       let total = 0, decided = 0;
       state.pages.forEach(p => p.segments.forEach(s => {
@@ -1478,9 +1636,12 @@
       page.segments.forEach((seg, i) => {
         const key = `${page.index}-${i}`;
         if (seg.type === 'text') {
-          const content = state.textEdits[key] !== undefined ? state.textEdits[key] : seg.content;
-          const edited = state.textEdits[key] !== undefined ? ' edited' : '';
-          html += `<span class="text-seg${edited}" data-key="${key}" data-original="${escAttr(seg.content)}" contenteditable="true" spellcheck="false">${esc(content)}</span>`;
+          const editedVal = state.textEdits[key];
+          const isEdited = editedVal !== undefined;
+          const content = isEdited ? editedVal : seg.content;
+          const edited = isEdited ? ' edited' : '';
+          const inner = isEdited ? renderCharDiff(seg.content, content) : esc(content);
+          html += `<span class="text-seg${edited}" data-key="${key}" data-original="${escAttr(seg.content)}" data-current="${escAttr(content)}" contenteditable="true" spellcheck="false">${inner}</span>`;
         } else if (seg.type === 'typo') {
           html += renderTypo(seg);
         } else if (seg.type === 'del') {
@@ -1675,6 +1836,15 @@
       const input = document.getElementById('editFor_' + id);
       input.focus();
       input.select();
+      input.addEventListener('input', () => {
+        // Live x→š, v→ū. 1-for-1 replacement so caret offset stays valid.
+        const next = applyTransliteration(input.value);
+        if (next !== input.value) {
+          const pos = input.selectionStart;
+          input.value = next;
+          input.setSelectionRange(pos, pos);
+        }
+      });
       input.addEventListener('keydown', e => {
         if (e.key === 'Enter') { e.preventDefault(); saveEditInput(id); }
         if (e.key === 'Escape') { e.preventDefault(); renderCurrentPages(); }
@@ -1684,7 +1854,7 @@
     function saveEditInput(tagId) {
       const input = document.getElementById('editFor_' + tagId);
       if (!input) return;
-      const val = input.value.trim();
+      const val = applyTransliteration(input.value.trim());
       state.decisions[tagId] = { action: 'edit', editValue: val };
       saveState();
       renderCurrentPages();
@@ -1702,16 +1872,40 @@
     function setupTextEditing() {
       const container = document.getElementById('content');
 
+      // Strip formatting on paste — inserting raw HTML breaks the diff math.
+      container.addEventListener('paste', e => {
+        const seg = e.target.closest && e.target.closest('.text-seg');
+        if (!seg) return;
+        e.preventDefault();
+        const text = (e.clipboardData || window.clipboardData).getData('text/plain');
+        document.execCommand('insertText', false, text);
+      });
+
+      // Live re-render: on every input, read the user's current text (ignoring
+      // .te-del markers from the previous diff), recompute the diff, write it
+      // back, and restore the caret to the same live-char offset.
       container.addEventListener('input', e => {
         const seg = e.target.closest('.text-seg');
         if (!seg) return;
-        const key = seg.dataset.key;
-        const original = seg.dataset.original;
-        const current = seg.textContent;
-        if (current !== original) {
-          seg.classList.add('edited');
-        } else {
+        const original = seg.dataset.original || '';
+        const caret = getSegCaretOffset(seg);
+        const raw = readSegLiveText(seg);
+        // Auto-substitute x→š, v→ū (case-matched). 1-for-1 char replacement
+        // so the caret offset stays correct without adjustment.
+        const current = applyTransliteration(raw);
+
+        if (current === original) {
           seg.classList.remove('edited');
+          seg.dataset.current = original;
+          if (seg.querySelector('.te-del, .te-add')) {
+            seg.innerHTML = esc(original);
+            if (caret !== null) setSegCaretOffset(seg, caret);
+          }
+        } else {
+          seg.classList.add('edited');
+          seg.dataset.current = current;
+          seg.innerHTML = renderCharDiff(original, current);
+          if (caret !== null) setSegCaretOffset(seg, caret);
         }
       });
 
@@ -1719,12 +1913,14 @@
         const seg = e.target.closest('.text-seg');
         if (!seg) return;
         const key = seg.dataset.key;
-        const original = seg.dataset.original;
-        const current = seg.textContent;
+        const original = seg.dataset.original || '';
+        const current = applyTransliteration(readSegLiveText(seg));
         if (current !== original) {
           state.textEdits[key] = current;
+          seg.dataset.current = current;
         } else {
           delete state.textEdits[key];
+          seg.dataset.current = original;
         }
         saveState();
       });
@@ -2454,12 +2650,20 @@
     // ================================================================
     function setupKeyboard() {
       document.addEventListener('keydown', function (e) {
+        // Shift+Space: next page from anywhere, including mid-edit. Plain
+        // Space still types a space inside editable text regions.
+        if (e.key === ' ' && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+          e.preventDefault();
+          nextPage();
+          return;
+        }
+
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
         if (e.target.isContentEditable) return;
         // Don't interfere when export modal is open
         if (document.getElementById('exportModal')) return;
 
-        // Page navigation
+        // Page navigation (plain arrows, only when not editing text)
         if (e.key === 'ArrowLeft') { e.preventDefault(); prevPage(); return; }
         if (e.key === 'ArrowRight') { e.preventDefault(); nextPage(); return; }
 
